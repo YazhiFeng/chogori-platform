@@ -51,8 +51,16 @@ public:
                         _client(client), _w_id(w_id) {
 
         _d_id = random.UniformRandom(1, _districts_per_warehouse());
-        _c_id = random.NonUniformRandom(1023, 1, _customers_per_district()); // TODO, by last name
         uint32_t local = random.UniformRandom(1, 100);
+        if (local <= 60) {
+            // by last name
+            k2::String lastName = random.RandowLastNameString();
+            _c_id = getCIdByLastName(lastName);
+        } else {
+            _c_id = random.NonUniformRandom(1023, 1, _customers_per_district()); // by customeer number
+        }
+
+        local = random.UniformRandom(1, 100);
         if (local <= 85 || max_w_id == 1) {
             _c_w_id = _w_id;
             _c_d_id = _d_id;
@@ -179,6 +187,65 @@ private:
     future<> historyUpdate() {
         History history(_w_id, _d_id, _c_id, _c_w_id, _c_d_id, _amount, _w_name.c_str(), _d_name.c_str());
         return writeRow<History>(history, _txn).discard_result();
+    }
+
+    int32_t getCIdByLastName(String lastName) {
+        
+        return _client.createQuery(tpccCollectionName, "customer")
+        .then([this](auto&& response) mutable {
+            K2INFO("createQuery status:" << response.status.code);
+
+            // make Query request and set query rules. 
+            // 1. range:[ (_w_id, _d_id, 0), (_w_id, _d_id + 1, 0) ); 2. no record number limits; 3. forward direction scan;
+            // 4. projection "FirstName" field for ascending sorting; 5. filter out the record rows of lastName
+            Query query = std::move(response.query);
+            query.startScanRecord.serializeNext<int16_t>(_w_id); 
+            query.startScanRecord.serializeNext<int16_t>(_d_id);
+            query.startScanRecord.serializeNext<int16_t>(0);
+            query.endScanRecord.serializeNext<int16_t>(_w_id);
+            query.endScanRecord.serializeNext<int16_t>(_d_id + 1);
+            query.endScanRecord.serializeNext<int16_t>(0);
+            query.setLimit(-1);
+            query.setReverseDirection(false);
+            query.addProjection({"FirstName"});
+            std::vector<dto::expression::Value> values; // make filter Expression
+            std::vector<dto::expression::Expression> exps;
+            values.emplace_back(dto::expression::makeValueReference("FirstName"));
+            values.emplace_back(dto::expression::makeValueLiteral<String>(lastName));
+            dto::expression filter = dto::expression::makeExpression(dto::expression::Operation::EQ, 
+                                                                    std::move(values), std::move(exps));
+            query.setFilterExpression(std::move(filter));
+
+            return do_with(std::vector<std::vector<dto::SKVRecord>>(), false, 
+            [this, query] (std::vector<std::vector<dto::SKVRecord>>& result_set, bool& done) {
+                return do_until(
+                [this, &done] () { return done; },
+                [this, &result_set, &done, query] () {
+                    return _txn.query(query)
+                    .then([this, query, &result_set, &done] (auto&& response) {
+                        K2INFO("query response code:" << response.status.code);
+                        done = response.status.is2xxOK() ? query.isDone() : true;
+                        result_set.push_back(std::move(response.records));
+                    });
+                })
+                .then([&result_set] () {
+                    std::vector<CIdSortElement> cIdSort;
+                    for (std::vector<dto::SKVRecord>& set : result_set) {
+                        for (dto::SKVRecord& rec : set) {
+                            std::optional<int16_t> wIdOpt = rec.deserializeNext<int16_t>();
+                            std::optional<int16_t> dIdOpt = rec.deserializeNext<int16_t>();
+                            std::optional<int32_t> cIdOpt = rec.deserializeNext<int32_t>();
+                            std::optional<String> firstNameOpt = rec.deserializeNext<String>();
+
+                            cIdSort.push_back(CIdSortElement{*firstNameOpt, *cIdOpt});
+                        }
+                    }
+
+                    std::sort(cIdSort.begin(), cIdSort.end());
+                    return cIdSort[cIdSort.size() / 2].c_id;
+                });
+            });
+        });
     }
 
     K23SIClient& _client;
@@ -378,4 +445,12 @@ private:
     std::decimal::decimal64 _d_tax;
     std::decimal::decimal64 _c_discount;
     std::decimal::decimal64 _total_amount = 0;
+};
+
+struct CIdSortElement {
+    String firstName;
+    int32_t c_id; 
+    bool operator<(const CIdElement& other) const noexcept {
+        return firstName < other.firstName;
+    }
 };
