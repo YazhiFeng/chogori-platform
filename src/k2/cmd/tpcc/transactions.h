@@ -160,9 +160,11 @@ private:
         future<int32_t> cidFuture = make_ready_future<int>();
         if (cid_type <= 60) {
             // 60% randomly select customer by last name
+            std::cout << "customerUpdate 60" << std::endl;
             cidFuture = getCIdByLastName();
         } else {
             // 40% randomly select customer by customer id
+            std::cout << "customerUpdate 40" << std::endl;
             cidFuture = make_ready_future<int32_t>(_c_id);
         }
         
@@ -211,7 +213,7 @@ private:
         
         return _client.createQuery(tpccCollectionName, "customer")
         .then([this, &lastName](auto&& response) mutable {
-            K2INFO("createQuery status:" << response.status.code);
+            K2EXPECT(response.status, dto::K23SIStatus::OK);
 
             // make Query request and set query rules. 
             // 1. range:[ (_w_id, _d_id, 0), (_w_id, _d_id + 1, 0) ); 2. no record number limits; 3. forward direction scan;
@@ -235,14 +237,19 @@ private:
                                                                     std::move(values), std::move(exps));
             query.setFilterExpression(std::move(filter));
 
+            std::cout << "getCIdByLastName 1" << std::endl;
             return do_with(std::vector<std::vector<dto::SKVRecord>>(), false, 
             [this, &query] (std::vector<std::vector<dto::SKVRecord>>& result_set, bool& done) {
+                std::cout << "getCIdByLastName 2" << std::endl;
                 return do_until(
                 [this, &done] () { return done; },
                 [this, &result_set, &done, &query] () {
+                    std::cout << "getCIdByLastName 3" << std::endl;
+                    std::cout << "_txn.query:" << query.startScanRecord.getKey() << query.endScanRecord.getKey() << std::endl;
                     return _txn.query(query)
                     .then([this, &query, &result_set, &done] (auto&& response) {
-                        K2INFO("query response code:" << response.status.code);
+                        std::cout << "query response code:" << response.status.code << std::endl;;
+                        K2EXPECT(response.status.is2xxOK(), true);
                         done = response.status.is2xxOK() ? query.isDone() : true;
                         result_set.push_back(std::move(response.records));
                     });
