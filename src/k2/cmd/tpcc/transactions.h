@@ -48,19 +48,12 @@ class PaymentT : public TPCCTxn
 {
 public:
     PaymentT(RandomContext& random, K23SIClient& client, int16_t w_id, int16_t max_w_id) :
-                        _client(client), _w_id(w_id) {
+                        _random(random), _client(client), _w_id(w_id) {
 
         _d_id = random.UniformRandom(1, _districts_per_warehouse());
+        // customer id will be re-assign based on probability later during customerUpdate()
+        _c_id = random.NonUniformRandom(1023, 1, _customers_per_district()); 
         uint32_t local = random.UniformRandom(1, 100);
-        if (local <= 60) {
-            // by last name
-            k2::String lastName = random.RandowLastNameString();
-            _c_id = getCIdByLastName(lastName);
-        } else {
-            _c_id = random.NonUniformRandom(1023, 1, _customers_per_district()); // by customeer number
-        }
-
-        local = random.UniformRandom(1, 100);
         if (local <= 85 || max_w_id == 1) {
             _c_w_id = _w_id;
             _c_d_id = _d_id;
@@ -154,34 +147,48 @@ private:
     }
 
     future<> customerUpdate() {
-        return _txn.read<Customer>(Customer(_c_w_id, _c_d_id, _c_id))
-        .then([this] (auto&& result) {
-            CHECK_READ_STATUS(result);
+        uint32_t cid_type = _random.UniformRandom(1, 100);
+        future<int32_t> cidFuture;
+        if (cid_type <= 60) {
+            // 60% randomly select customer by last name
+            cidFuture = getCIdByLastName();
+        } else {
+            // 40% randomly select customer by customer id
+            cidFuture = make_ready_future<int32_t>(_c_id);
+        }
+        
+        return when_all_succeed(std::move(cidFuture))
+        .then([this] (int32_t&& resp) {
+            _c_id = resp;
+            return _txn.read<Customer>(Customer(_c_w_id, _c_d_id, _c_id))
+            .then([this] (auto&& result) {
+                CHECK_READ_STATUS(result);
 
-            Customer customer(_c_w_id, _c_d_id, _c_id);
-            customer.Balance = *(result.value.Balance) - _amount;
-            customer.YTDPayment = *(result.value.YTDPayment) + _amount;
-            customer.PaymentCount = *(result.value.PaymentCount) + 1;
-            k2::String str500(k2::String::initialized_later{}, 500);
-            customer.Info = str500;
+                Customer customer(_c_w_id, _c_d_id, _c_id);
+                customer.Balance = *(result.value.Balance) - _amount;
+                customer.YTDPayment = *(result.value.YTDPayment) + _amount;
+                customer.PaymentCount = *(result.value.PaymentCount) + 1;
+                k2::String str500(k2::String::initialized_later{}, 500);
+                customer.Info = str500;
 
-            if (*(result.value.Credit) == "BC") {
-                size_t shift_size = sizeof(_c_id) + sizeof(_c_d_id) + sizeof(_d_id) + sizeof(_w_id) + sizeof(_amount);
-                memcpy((char*)customer.Info->c_str() + shift_size, (char*)result.value.Info->c_str(), 500-shift_size);
-                uint32_t offset = 0;
-                memcpy((char*)customer.Info->c_str() + offset, &_c_id, sizeof(_c_id));
-                offset += sizeof(_c_id);
-                memcpy((char*)customer.Info->c_str() + offset, &_c_d_id, sizeof(_c_d_id));
-                offset += sizeof(_c_d_id);
-                memcpy((char*)customer.Info->c_str() + offset, &_d_id, sizeof(_d_id));
-                offset += sizeof(_d_id);
-                memcpy((char*)customer.Info->c_str() + offset, &_w_id, sizeof(_w_id));
-                offset += sizeof(_w_id);
-                memcpy((char*)customer.Info->c_str() + offset, &_amount, sizeof(_amount));
-            }
+                if (*(result.value.Credit) == "BC") {
+                    size_t shift_size = sizeof(_c_id) + sizeof(_c_d_id) + sizeof(_d_id) + sizeof(_w_id) + sizeof(_amount);
+                    memcpy((char*)customer.Info->c_str() + shift_size, (char*)result.value.Info->c_str(), 500-shift_size);
+                    uint32_t offset = 0;
+                    memcpy((char*)customer.Info->c_str() + offset, &_c_id, sizeof(_c_id));
+                    offset += sizeof(_c_id);
+                    memcpy((char*)customer.Info->c_str() + offset, &_c_d_id, sizeof(_c_d_id));
+                    offset += sizeof(_c_d_id);
+                    memcpy((char*)customer.Info->c_str() + offset, &_d_id, sizeof(_d_id));
+                    offset += sizeof(_d_id);
+                    memcpy((char*)customer.Info->c_str() + offset, &_w_id, sizeof(_w_id));
+                    offset += sizeof(_w_id);
+                    memcpy((char*)customer.Info->c_str() + offset, &_amount, sizeof(_amount));
+                }
 
-            return partialUpdateRow<Customer, std::vector<k2::String>>(customer, {"Balance", "YTDPayment", "PaymentCount", "Info"}, _txn).discard_result();
-        });
+                return partialUpdateRow<Customer, std::vector<k2::String>>(customer, {"Balance", "YTDPayment", "PaymentCount", "Info"}, _txn).discard_result();
+            });
+        })
     }
 
     future<> historyUpdate() {
@@ -189,7 +196,9 @@ private:
         return writeRow<History>(history, _txn).discard_result();
     }
 
-    int32_t getCIdByLastName(String lastName) {
+    // get customer ID by last name
+    future<int32_t> getCIdByLastName() {
+        k2::String lastName = _random.RandowLastNameString();
         
         return _client.createQuery(tpccCollectionName, "customer")
         .then([this](auto&& response) mutable {
@@ -241,13 +250,17 @@ private:
                         }
                     }
 
+                    // sorted by C_FIRST_NAME in ascending order, and retrieve at the
+                    // position n/2 rounded up in the sorted set from CUSTORMER table.
                     std::sort(cIdSort.begin(), cIdSort.end());
-                    return cIdSort[cIdSort.size() / 2].c_id;
+                    return make_ready_future<int32_t>(cIdSort[cIdSort.size() / 2].c_id);
                 });
             });
         });
     }
 
+
+    RandomContext& _random;
     K23SIClient& _client;
     K2TxnHandle _txn;
     int16_t _w_id;
