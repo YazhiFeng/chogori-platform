@@ -36,6 +36,15 @@ Copyright(c) 2020 Futurewei Cloud
 using namespace seastar;
 using namespace k2;
 
+
+struct CIdSortElement {
+    String firstName;
+    int32_t c_id; 
+    bool operator<(const CIdSortElement& other) const noexcept {
+        return firstName < other.firstName;
+    }
+};
+
 class AtomicVerify;
 
 class TPCCTxn {
@@ -148,7 +157,7 @@ private:
 
     future<> customerUpdate() {
         uint32_t cid_type = _random.UniformRandom(1, 100);
-        future<int32_t> cidFuture;
+        future<int32_t> cidFuture = make_ready_future<int>();
         if (cid_type <= 60) {
             // 60% randomly select customer by last name
             cidFuture = getCIdByLastName();
@@ -188,7 +197,7 @@ private:
 
                 return partialUpdateRow<Customer, std::vector<k2::String>>(customer, {"Balance", "YTDPayment", "PaymentCount", "Info"}, _txn).discard_result();
             });
-        })
+        });
     }
 
     future<> historyUpdate() {
@@ -201,7 +210,7 @@ private:
         k2::String lastName = _random.RandowLastNameString();
         
         return _client.createQuery(tpccCollectionName, "customer")
-        .then([this](auto&& response) mutable {
+        .then([this, &lastName](auto&& response) mutable {
             K2INFO("createQuery status:" << response.status.code);
 
             // make Query request and set query rules. 
@@ -216,22 +225,23 @@ private:
             query.endScanRecord.serializeNext<int16_t>(0);
             query.setLimit(-1);
             query.setReverseDirection(false);
-            query.addProjection({"FirstName"});
+            std::vector<String> projection{"FirstName"}; // make projection
+            query.addProjection(projection);
             std::vector<dto::expression::Value> values; // make filter Expression
             std::vector<dto::expression::Expression> exps;
             values.emplace_back(dto::expression::makeValueReference("FirstName"));
-            values.emplace_back(dto::expression::makeValueLiteral<String>(lastName));
-            dto::expression filter = dto::expression::makeExpression(dto::expression::Operation::EQ, 
+            values.emplace_back(dto::expression::makeValueLiteral<String>(std::move(lastName)));
+            dto::expression::Expression filter = dto::expression::makeExpression(dto::expression::Operation::EQ, 
                                                                     std::move(values), std::move(exps));
             query.setFilterExpression(std::move(filter));
 
             return do_with(std::vector<std::vector<dto::SKVRecord>>(), false, 
-            [this, query] (std::vector<std::vector<dto::SKVRecord>>& result_set, bool& done) {
+            [this, &query] (std::vector<std::vector<dto::SKVRecord>>& result_set, bool& done) {
                 return do_until(
                 [this, &done] () { return done; },
-                [this, &result_set, &done, query] () {
+                [this, &result_set, &done, &query] () {
                     return _txn.query(query)
-                    .then([this, query, &result_set, &done] (auto&& response) {
+                    .then([this, &query, &result_set, &done] (auto&& response) {
                         K2INFO("query response code:" << response.status.code);
                         done = response.status.is2xxOK() ? query.isDone() : true;
                         result_set.push_back(std::move(response.records));
@@ -246,6 +256,7 @@ private:
                             std::optional<int32_t> cIdOpt = rec.deserializeNext<int32_t>();
                             std::optional<String> firstNameOpt = rec.deserializeNext<String>();
 
+                            (void)wIdOpt, (void)dIdOpt;
                             cIdSort.push_back(CIdSortElement{*firstNameOpt, *cIdOpt});
                         }
                     }
@@ -460,10 +471,3 @@ private:
     std::decimal::decimal64 _total_amount = 0;
 };
 
-struct CIdSortElement {
-    String firstName;
-    int32_t c_id; 
-    bool operator<(const CIdElement& other) const noexcept {
-        return firstName < other.firstName;
-    }
-};

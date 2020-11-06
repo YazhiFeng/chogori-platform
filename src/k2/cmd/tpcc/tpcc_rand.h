@@ -29,7 +29,7 @@ Copyright(c) 2020 Futurewei Cloud
 #include <cstring>
 
 // definition from TPCC clause 4.3.2.3
-static const std::vector<k2::string> LastNameChart {"BAR", "OUGHT", "ABLE", "PRI", "PRES", "ESE", "ANTI", "CALLY", "ATION", "EING"};
+static const std::vector<k2::String> LastNameChart {"BAR", "OUGHT", "ABLE", "PRI", "PRES", "ESE", "ANTI", "CALLY", "ATION", "EING"};
 
 class RandomContext {
 public:
@@ -117,7 +117,7 @@ public:
         uint32_t nuRand = NonUniformRandom(255, 0, 999);
         k2::String lastNameString;
 
-        for (uint32_t i = 0; i < 3; <++i) {
+        for (uint32_t i = 0; i < 3; ++i) {
             lastNameString = LastNameChart[nuRand % 10] + lastNameString;
             nuRand /= 10;
         }
