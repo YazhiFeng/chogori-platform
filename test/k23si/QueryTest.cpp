@@ -84,11 +84,11 @@ public:  // application lifespan
             K2EXPECT(result.status.is2xxOK(), true);
         })
         .then([this] { return runSetup(); })
-        .then([this] { return runScenario01(); })
-        .then([this] { return runScenario02(); })
-        .then([this] { return runScenario03(); })
-        .then([this] { return runScenario04(); })
-        .then([this] { return runScenario05(); })
+        .then([this] { return runScenario00(); })
+        //.then([this] { return runScenario02(); })
+        //.then([this] { return runScenario03(); })
+        //.then([this] { return runScenario04(); })
+        //.then([this] { return runScenario05(); })
         .then([this] {
             K2INFO("======= All tests passed ========");
             exitcode = 0;
@@ -543,6 +543,62 @@ seastar::future<> runScenario05() {
 }
 
 // TODO: add test Scenario to deal with query request while change the partition map
+
+// --------------
+seastar::future<> sleep1() {
+    return seastar::sleep(200ms)
+    .then([] { std::cout << "sleep1" << std::endl; });
+}
+
+seastar::future<> sleep2() {
+    return seastar::sleep(200ms)
+    .then([] { std::cout << "sleep2" << std::endl; });
+}
+
+
+seastar::future<int> getID() {
+    int id = 6322;
+    return seastar::sleep(200ms)
+    .then([] {
+        std::cout << "sleep 1" << std::endl;
+    })
+    .then([] {
+        return seastar::sleep(200ms);
+    })
+    .then([] {
+        std::cout << "sleep 2" << std::endl;
+    })
+    .then([&id] {
+        return seastar::make_ready_future<int>(id);
+    });
+}
+
+seastar::future<> do_when_all() {
+    int i = 10;
+    seastar::future<int> cfuture = seastar::make_ready_future<int>();
+    if (i < 60) {
+        cfuture = seastar::make_ready_future()
+        .then([this] {
+            return getID();
+        });
+    } 
+
+    seastar::future<> sleep2_f = seastar::when_all_succeed(std::move(cfuture))
+    .then([this](auto&& resp) {
+        std::cout << "resp:" << resp << std::endl;
+        
+        return sleep1();
+    });
+}
+
+seastar::future<> runScenario00() {
+    std::cout << "begin runScenario00" << std::endl;
+    return do_when_all().
+    then([] {
+        std::cout << "end runScenario00" << std::endl;
+    });
+}
+
 
 };  // class QueryTest
 
