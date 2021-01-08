@@ -800,3 +800,364 @@ private:
     std::vector<std::decimal::decimal64> _out_ol_amount;
     std::vector<int16_t> _out_ol_quantity;
 };
+
+class DeliveryT : public TPCCTxn
+{
+public:
+    DeliveryT(RandomContext& random, K23SIClient& client, int16_t w_id, uint8_t batch_size = 10) :
+                _random(random), _client(client), _w_id(w_id) {
+        // range from 1-10 is allowed, otherwise set to 10
+        _batch_size = (batch_size <= 10 || batch_size > 0) ? batch_size : 10;
+        for (uint8_t i = 0; i < 10; ++i){
+            _d_id.push_back(_random.UniformRandom(1, _districts_per_warehouse()));
+            _o_carrier_id.push_back(_random.UniformRandom(1, 10));
+        }
+
+        _failed = false;
+    }
+
+    future<bool> run() override {
+        return do_with((uint64_t)0, [this] (uint64_t& batchStart) {
+            return do_until(
+            [this, &batchStart] { return batchStart >= 10; },
+            [this, &batchStart] {
+                auto start = _d_id.begin() + batchStart;
+                batchStart += std::min((uint64_t)_batch_size, (uint64_t)(10 - batchStart));
+                auto end = _d_id.begin() + batchStart;
+
+                K2TxnOptions options{};
+                options.deadline = Deadline(5s);
+                options.priority = dto::TxnPriority::Low;
+                options.syncFinalize = false;
+
+                return _client.beginTxn(options) // begin a txn
+                .then([this, &start, &end, &batchStart] (K2TxnHandle&& txn) {
+                    _txn = std::move(txn);
+                    return runWithTxn(start, end, batchStart); // run txn
+                })
+                .then([this, &batchStart] {
+                    // end txn
+                    if (_failed) {
+                        return _txn.end(false);
+                    }
+
+                    K2DEBUG("A DeliveryT txn batch of " << (uint32_t)_batch_size << " success, ending with " << batchStart);
+                    
+                    return _txn.end(true);
+                })
+                .then_wrapped([this] (auto&& fut) {
+                    if (fut.failed()) {
+                        _failed = true;
+                        fut.ignore_ready_future();
+                    }
+                });
+            })
+            .then([this]() {
+                if (_failed) {
+                    return make_ready_future<bool>(false);
+                }
+                return make_ready_future<bool>(true);
+            });
+        });
+    }
+
+private:
+    future<> runWithTxn(std::vector<int16_t>::iterator start, std::vector<int16_t>::iterator end, uint64_t idx) {
+        return parallel_for_each(start, end, [this, &idx](auto& dID) {
+            // get lowest NO_O_ID row in NEW-ORDER table with matching w_id and d_id
+            return getOrderID(dID)
+            .then([this, &idx] (auto&& flag) {
+                bool getFlag = flag;
+                if (getFlag == false && _miss_once == true) {
+                    // report MISS_condition occurs more than once of the delivery transaction
+                    K2WARN("TPCC DeliveryT MISS_Condition: occurs more than once of the delivery transaction"); 
+
+                    return  make_ready_future<>();
+                }
+
+                _miss_once = !getFlag;
+
+                // delete the selected row in NEW-ORDER table
+                future<> delNORow_f = delNewOrderRow(idx);
+
+                // retrieve the customer number in ORDER table
+                future<> getCustomerID_f = getCustomerID(idx);
+
+                // update the carrierID in ORDER table
+                future<> updateCarrierID_f = updateCarrierID(idx);
+
+                // all rows in the ORDER_LINE table with mathing w_id, d_id, o_id are seclected,
+                // get the sum of all OL_AMOUNT
+                future<> getOLAmount_f = getOLSumAmount(idx);
+
+                // When get Order Line count, update the OL_DELIVERY_D, the delivery dates, to the
+                // current system time in the ORDER_LINE table
+                future<> updateOLDeliveryD_f = when_all_succeed(std::move(getCustomerID_f))
+                .then([this, &idx] () {
+                    return updateOLDeliveryD(idx);
+                });
+
+                // update the row in the CUSTOMER table
+                // future<> updateCustomerRow_f = when_all_succeed(getCustomerID_f, std::move(getOLAmount_f))
+                // .then([this, &idx] () {
+                //     return updateCustomerRow(idx);
+                // });
+
+                return when_all_succeed(std::move(delNORow_f), std::move(updateCarrierID_f), 
+                                std::move(updateOLDeliveryD_f)) //std::move(updateCustomerRow_f)
+                .then_wrapped([this, &idx] (auto&& fut) {
+                    if (fut.failed()) {
+                        K2DEBUG("A DeliveryT txn batch of " << (uint32_t)_batch_size << " failed, ending with " << idx);
+                        _failed = true;
+                    }
+
+                    return make_ready_future<>();
+                });
+            });
+        });
+    }
+
+    // get lowest NO_O_ID row in NEW-ORDER table with matching _w_id and _d_id
+    future<bool> getOrderID(int16_t dID) {
+        (void) dID;
+        return make_ready_future<bool>(true);
+        // return _client.createQuery(tpccCollectionName, "neworder")
+        // .then([this](auto&& response) mutable {
+        //     CHECK_READ_STATUS(response);
+
+        //     // make Query request and set Query rules.
+        //     // 1) just return the lowest SKVRecord; 2) add Projection fields (i.e. oid) as needed;
+        //     _query_oid = std::move(response.query);
+        //     _query_oid.startScanRecord.serializeNext<int16_t>(_w_id);
+        //     _query_oid.startScanRecord.serializeNext<int16_t>(_d_id[idx]);
+        //     _query_oid.endScanRecord.serializeNext<int16_t>(_w_id);
+        //     _query_oid.endScanRecord.serializeNext<int16_t>(_d_id[idx] + 1);
+        //     _query_oid.setLimit(1);
+        //     _query_oid.setReverseDirection(false);
+
+        //     std::vector<String> projection{"OID"};  // make projection
+        //     _query_oid.addProjection(projection);
+        //     dto::expression::Expression filter{};   // make filter expression
+        //     _query_oid.setFilterExpression(std::move(filter));
+
+        //     return _txn.query(_query_oid)
+        //     .then([this] (auto&& response) {
+        //         CHECK_READ_STATUS(response);
+
+        //         if (response.records.size()) {
+        //             dto::SKVRecord& rec = response.records[0];
+        //             // get order id
+        //             std::optional<int64_t> orderIDOpt = rec.deserializeField<int64_t>("OID");
+        //             _NO_O_ID[idx] = *orderIDOpt;
+
+        //             return make_ready_future<bool>(true);
+        //         } else {
+        //             // set all output values to -1
+        //             _NO_O_ID[idx] = -1;
+        //             _O_C_ID[idx] = -1;
+        //             _OL_SUM_AMOUNT[idx] = -1;
+
+        //             return make_ready_future<bool>(false);
+        //         }
+        //     });
+        // });
+    }
+
+    // delete the selected row in NEW-ORDER table
+    future<> delNewOrderRow(uint8_t idx) {
+        NewOrder delNORow(_w_id, _d_id[idx], _NO_O_ID[idx]);
+        return writeRow<NewOrder>(delNORow, _txn, true).discard_result();
+    }
+
+    // retrieve the customer number in ORDER table with matching _w_id, _d_id and _no_o_id
+    future<> getCustomerID(uint8_t idx) {
+        (void) idx;
+        return make_ready_future<>();
+        // return _client.createQuery(tpccCollectionName, "order")
+        // .then([this] (auto&& response) mutable {
+        //     CHECK_READ_STATUS(response);
+
+        //     // make Query request and set query rules.
+        //     // (1) add projection fields (i.e. LineCount, CID) as needed;
+        //     _query_cid = std::move(response.query);
+        //     _query_cid.startScanRecord.serializeNext<int16_t>(_w_id);
+        //     _query_cid.startScanRecord.serializeNext<int16_t>(_d_id[idx]);
+        //     _query_cid.startScanRecord.serializeNext<int64_t>(_NO_O_ID[idx]);
+        //     _query_cid.endScanRecord.serializeNext<int16_t>(_w_id);
+        //     _query_cid.endScanRecord.serializeNext<int16_t>(_d_id[idx]);
+        //     _query_cid.endScanRecord.serializeNext<int64_t>(_NO_O_ID[idx] + 1);
+        //     _query_cid.setLimit(1);
+        //     _query_cid.setReverseDirection(false);
+
+        //     std::vector<String> projection("LineCount", "CID");  // make projection
+        //     _query_cid.addProjection(projection);
+        //     dto::expression::Expression filter{};   // make filter Expression
+        //     _query_cid.setFilterExpression(std::move(filter));
+
+        //     return _txn.query(_query_cid)
+        //     .then([this] (auto&& response) {
+        //         CHECK_READ_STATUS(response);
+
+        //         // get customer ID
+        //         dto::SKVRecord& rec = response.records[0];
+        //         std::optional<int16_t> lineCountOpt = rec.deserializeField<int16_t>("LineCount");
+        //         std::optional<int32_t> cidOpt = rec.deserializeField<int32_t>("CID");
+        //         _o_line_count[idx] = *lineCountOpt;
+        //         _O_C_ID[idx] = *cidOpt;
+
+        //         return make_ready_future();
+        //     });
+        // });
+    }
+
+    // update the carrierID in ORDER table
+    future<> updateCarrierID(uint8_t idx) {
+        std::vector<String> updateFields({"CarrierID"});
+
+        Order updateOrder(_w_id, _d_id[idx], _NO_O_ID[idx]);
+        updateOrder.CarrierID = _o_carrier_id[idx];
+
+        return partialUpdateRow<Order, std::vector<String>>(updateOrder, updateFields, _txn).discard_result();
+    }
+
+    // all rows in the ORDER_LINE table with mathing w_id, d_id, o_id are seclected,
+    // get the sum of all OL_AMOUNT
+    future<> getOLSumAmount(uint8_t idx) {
+        (void) idx;
+        return make_ready_future<>();
+        // return _client.createQuery(tpccCollectionName, "orderline")
+        // .then([this, &idx](auto&& response) mutable {
+        //     CHECK_READ_STATUS(response);
+        
+        //     // make Query request and set query rules. 
+        //     // 1) all lines in the certain order are returned; 
+        //     // 2) add Projection fields (i.e. amount) as needed;
+        //     _query_order_line = std::move(response.query);
+        //     _query_order_line.startScanRecord.serializeNext<int16_t>(_w_id); 
+        //     _query_order_line.startScanRecord.serializeNext<int16_t>(_d_id[idx]);
+        //     _query_order_line.startScanRecord.serializeNext<int64_t>(_NO_O_ID[idx]);
+        //     _query_order_line.endScanRecord.serializeNext<int16_t>(_w_id);
+        //     _query_order_line.endScanRecord.serializeNext<int16_t>(_d_id[idx]);
+        //     _query_order_line.endScanRecord.serializeNext<int64_t>(_NO_O_ID[idx] + 1);
+        //     _query_order_line.setLimit(-1);
+        //     _query_order_line.setReverseDirection(false);
+            
+        //     std::vector<String> projection{"Amount"};   // make projection
+        //     _query_order_line.addProjection(projection);
+        //     dto::expression::Expression filter{};       // make filter Expression
+        //     _query_order_line.setFilterExpression(std::move(filter));
+
+        //     return do_with(std::vector<std::vector<dto::SKVRecord>>(), false, (uint32_t)0,
+        //     [this, &idx] (std::vector<std::vector<dto::SKVRecord>>& result_set, bool& done, uint32_t& count) {
+        //         return do_until(
+        //         [this, &done] () { return done; },
+        //         [this, &result_set, &done, &count] () {
+        //             return _txn.query(_query_order_line)
+        //             .then([this, &result_set, &count, &done] (auto&& response) {
+        //                 CHECK_READ_STATUS(response);
+        //                 done = response.status.is2xxOK() ? _query_order_line.isDone() : true;
+        //                 count += response.records.size();
+        //                 result_set.push_back(std::move(response.records));
+                        
+        //                 return make_ready_future();
+        //             });
+        //         })
+        //         .then([this, &result_set, &count, &idx] {
+        //             for (auto& results : result_set) {
+        //                 for (auto& rec : results) {
+        //                     std::optional<std::decimal::decimal64> amountOpt = rec.deserializeField<std::decimal::decimal64>("Amount");
+        //                     _OL_SUM_AMOUNT[idx] += *amountOpt;
+        //                 }
+        //             }
+
+        //             return make_ready_future();
+        //         });
+        //     });
+        // });
+    }
+
+    // update the OL_DELIVERY_D, the delivery dates, to the current system time in the ORDER_LINE table
+    future<> updateOLDeliveryD(uint8_t idx) {
+        (void) idx;
+        return make_ready_future<>();
+        // int32_t lineNumber = _o_line_count[idx];
+
+        // return parallel_for_each(0, lineNumber, [this, &idx] (int32_t& lineNum) {
+        //     OrderLine updateOLRow(_w_id, _d_id[idx], _NO_O_ID[idx], lineNum);
+        //     updateOLRow.DeliveryDate = getDate();
+            
+        //     std::vector<String> OLUpdateFields("DeliveryDate");
+
+        //     return partialUpdateRow<OrderLine, std::vector<String>>(updateOLRow, OLUpdateFields, _txn).discard_result();
+        // });
+    }
+
+    // update the row in the CUSTOMER table
+    future<> updateCustomerRow(uint8_t idx) {
+        (void) idx;
+        return make_ready_future<>();
+        // return _client.createQuery(tpccCollectionName, "customer")
+        // .then([this, &idx] (auto&& response) mutable {
+        //     CHECK_READ_STATUS(response);
+
+        //     // make Query request and make projection
+        //     _query_customer = std::move(response.query);
+        //     _query_customer.startScanRecord.serializeNext<int16_t>(_w_id);
+        //     _query_customer.startScanRecord.serializeNext<int16_t>(_d_id[idx]);
+        //     _query_customer.startScanRecord.serializeNext<int64_t>(_NO_O_ID[idx]);
+        //     _query_customer.endScanRecord.serializeNext<int16_t>(_w_id);
+        //     _query_customer.endScanRecord.serializeNext<int16_t>(_d_id[idx]);
+        //     _query_customer.endScanRecord.serializeNext<int64_t>(_NO_O_ID[idx] + 1);
+        //     _query_customer.setLimit(1);
+        //     _query_customer.setReverseDirection(false);
+
+        //     std::vector<String> projection{"Balance", "DeliveryCount"}; // make projection
+        //     _query_customer.addProjection(projection);
+        //     dto::expression::Expression filter{}; // make filter Expression
+        //     _query_order_line.setFilterExpression(std::move(filter));
+            
+        //     return _txn.query(_query_customer)
+        //     .then([this,  &idx] (auto&& response) {
+        //         CHECK_READ_STATUS(response);
+
+        //         dto::SKVRecord& rec = response.records[0];
+        //         std::optional<std::decimal::decimal64> balanceOpt = rec.deserializeField<std::decimal::decimal64>("Balance");
+        //         std::optional<int32_t> deliveryCountOpt = rec.deserializeField<int32_t>("DeliveryCount");
+
+        //         Customer updateCustomer(_w_id, _d_id[idx], _O_C_ID[idx]);
+        //         updateCustomer.Balance = *balanceOpt + _OL_SUM_AMOUNT[idx];
+        //         updateCustomer.DeliveryCount = *deliveryCountOpt + 1;
+                
+        //         std::vector<String> updateCustomerFileds("Balance", "DeliveryCount");
+
+        //         return partialUpdateRow<Customer, std::vector<String>>
+        //                 (updateCustomer, updateCustomerFileds, _txn).discard_result();
+        //     });
+        // });
+    }
+
+private:
+    RandomContext& _random;
+    K23SIClient& _client;
+    K2TxnHandle _txn;
+    bool _failed;
+    bool _miss_once = false;
+    uint8_t _batch_size; // range from 1-10 is allowed, otherwise set to 10
+    
+    int16_t _w_id;
+    std::vector<int16_t> _d_id;
+    std::vector<int32_t> _o_carrier_id;
+    std::vector<int16_t> _o_line_count = std::vector<int16_t>(10, -1); // Count how many Order Lines for each Order
+    Query _query_oid;
+    Query _query_cid;
+    Query _query_order_line;
+    Query _query_customer;
+
+    ConfigVar<uint16_t> _districts_per_warehouse{"districts_per_warehouse"};
+
+private:
+    // output data that DeliveryT wanna get
+    std::vector<int64_t> _NO_O_ID = std::vector<int64_t>(10, -1); // NEW-ORDER table info: order ID
+    std::vector<int32_t> _O_C_ID = std::vector<int32_t>(10, -1); // ORDER table info: customer ID
+    std::vector<std::decimal::decimal64> _OL_SUM_AMOUNT = std::vector<std::decimal::decimal64>(10, -1); // ORDER-LINE table info: sum of all amount
+};

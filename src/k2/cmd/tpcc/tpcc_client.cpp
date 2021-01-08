@@ -251,6 +251,8 @@ private:
                     curTxn = (TPCCTxn*) new PaymentT(_random, _client, w_id, _max_warehouses());
                 } else if (txn_type <= 47) {
                     curTxn = (TPCCTxn*) new OrderStatusT(_random, _client, w_id);
+                } else if (txn_type <= 51) {
+                    curTxn = (TPCCTxn*) new DeliveryT(_random, _client, w_id);
                 } else {
                     curTxn = (TPCCTxn*) new NewOrderT(_random, _client, w_id, _max_warehouses());
                 }
